@@ -13,6 +13,7 @@
 
 #include <sensor_msgs/Imu.h>
 #include <sensor_msgs/PointCloud2.h>
+#include <livox_ros_driver/CustomMsg.h>
 
 #include <nav_msgs/Odometry.h>
 
@@ -23,6 +24,7 @@
 
 
 Imu fromROS(const sensor_msgs::Imu::ConstPtr& in) {
+  const Config& cfg = Config::getInstance();
   Imu out;
   out.stamp = in->header.stamp.toSec();
 
@@ -30,9 +32,9 @@ Imu fromROS(const sensor_msgs::Imu::ConstPtr& in) {
   out.ang_vel(1) = in->angular_velocity.y;
   out.ang_vel(2) = in->angular_velocity.z;
 
-  out.lin_accel(0) = in->linear_acceleration.x;
-  out.lin_accel(1) = in->linear_acceleration.y;
-  out.lin_accel(2) = in->linear_acceleration.z;
+  out.lin_accel(0) = in->linear_acceleration.x * cfg.sensors.extrinsics.gravity;
+  out.lin_accel(1) = in->linear_acceleration.y * cfg.sensors.extrinsics.gravity;
+  out.lin_accel(2) = in->linear_acceleration.z * cfg.sensors.extrinsics.gravity;
 
   tf2::fromMsg(in->orientation, out.q);
 
@@ -53,6 +55,46 @@ PROFC_NODE("PointCloud2 to pcl")
 
   auto minmax = std::minmax_element(raw.points.begin(),
                                     raw.points.end(), 
+                                    get_point_time_comp());
+
+  if (minmax.first != raw.points.begin())
+    std::iter_swap(minmax.first, raw.points.begin());
+
+  if (minmax.second != raw.points.end() - 1)
+    std::iter_swap(minmax.second, raw.points.end() - 1);
+}
+
+void fromROS(const livox_ros_driver::CustomMsg& msg, PointCloudT& raw) {
+
+// PROFC_NODE("Livox CustomMsg to pcl")
+
+  raw.clear();
+  raw.reserve(msg.points.size());
+  raw.header.frame_id = msg.header.frame_id;
+  raw.header.stamp = msg.header.stamp.toNSec();
+
+  for (const auto& in_pt : msg.points) {
+    PointT out_pt;
+    out_pt.x = in_pt.x;
+    out_pt.y = in_pt.y;
+    out_pt.z = in_pt.z;
+    out_pt.intensity = static_cast<float>(in_pt.reflectivity);
+    out_pt.timestamp = static_cast<double>(msg.timebase) + static_cast<double>(in_pt.offset_time);
+    raw.push_back(out_pt);
+  }
+
+  raw.width = raw.size();
+  raw.height = 1;
+  raw.is_dense = false;
+
+  std::vector<int> indices;
+  pcl::removeNaNFromPointCloud(raw, raw, indices);
+
+  raw.width = raw.size();
+  raw.height = 1;
+
+  auto minmax = std::minmax_element(raw.points.begin(),
+                                    raw.points.end(),
                                     get_point_time_comp());
 
   if (minmax.first != raw.points.begin())

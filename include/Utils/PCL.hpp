@@ -51,21 +51,33 @@ typedef std::function<bool(const PointT&, const PointT&)> PointTimeComp;
 PointTime point_time_func() {
   Config& cfg = Config::getInstance();
 
+  constexpr double kNanoToSec = 1e-9;
+
   if (cfg.sensors.lidar.type == 0) { // OUSTER
-    return cfg.sensors.lidar.end_of_sweep
-      ? [] (const PointT& p, const double& sweep_time) { return sweep_time - p.t * 1e-9f; }
-      : [] (const PointT& p, const double& sweep_time) { return sweep_time + p.t * 1e-9f; };
+    if (cfg.sensors.lidar.end_of_sweep) {
+      return [kNanoToSec](const PointT& p, const double& sweep_time) {
+        return sweep_time - static_cast<double>(p.t) * kNanoToSec;
+      };
+    }
+    return [kNanoToSec](const PointT& p, const double& sweep_time) {
+      return sweep_time + static_cast<double>(p.t) * kNanoToSec;
+    };
 
   } else if (cfg.sensors.lidar.type == 1) { // VELODYNE
-    return cfg.sensors.lidar.end_of_sweep
-      ? [] (const PointT& p, const double& sweep_time) { return sweep_time - p.time; }
-      : [] (const PointT& p, const double& sweep_time) { return sweep_time + p.time; };
+    if (cfg.sensors.lidar.end_of_sweep) {
+      return [] (const PointT& p, const double& sweep_time) {
+        return sweep_time - p.time;
+      };
+    }
+    return [] (const PointT& p, const double& sweep_time) {
+      return sweep_time + p.time;
+    };
 
   } else if (cfg.sensors.lidar.type == 2) { // HESAI
     return [] (const PointT& p, const double& sweep_time) { return p.timestamp; };
 
   } else if (cfg.sensors.lidar.type == 3) { // LIVOX
-    return [] (const PointT& p, const double& sweep_time) { return p.timestamp * 1e-9f; };
+    return [kNanoToSec] (const PointT& p, const double& sweep_time) { return p.timestamp * kNanoToSec; };
 
   } else {
     std::cout << "-------------------------------------------\n";

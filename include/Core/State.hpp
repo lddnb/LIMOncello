@@ -310,6 +310,7 @@ PROFC_NODE("update")
   void b_w(const Eigen::Vector3d& in) { X.element<1>() = manif::R3d(in); }
   void b_a(const Eigen::Vector3d& in) { X.element<2>() = manif::R3d(in); }
   void g(const Eigen::Vector3d& in)   { X.element<3>() = manif::R3d(in); }
+  void t(const double in)             { stamp = in; }
 
 };
 

@@ -9,6 +9,7 @@
 #include <sensor_msgs/Imu.h>
 #include <sensor_msgs/PointCloud2.h>
 #include <std_msgs/Bool.h>
+#include <spdlog/spdlog.h>
 
 
 #include "Core/Octree.hpp"
@@ -141,15 +142,10 @@ public:
     }
 
   }
-
-
-  void lidar_callback(const sensor_msgs::PointCloud2::ConstPtr& msg) {
+  void process_pointcloud(const PointCloudT::Ptr& raw, double header_stamp) {
 PROFC_NODE("LiDAR Callback")
 
     Config& cfg = Config::getInstance();
-
-    PointCloudT::Ptr raw(boost::make_shared<PointCloudT>());
-    fromROS(*msg, *raw);
 
     if (raw->points.empty()) {
       ROS_ERROR("[LIMONCELLO] Raw PointCloud is empty!");
@@ -165,8 +161,8 @@ PROFC_NODE("LiDAR Callback")
     }
 
     PointTime point_time = point_time_func();
-    double sweep_time = msg->header.stamp.toSec() + cfg.sensors.TAI_offset;
-    
+    double sweep_time = header_stamp + cfg.sensors.TAI_offset;
+
     double offset = 0.0;
     if (cfg.sensors.time_offset) { // automatic sync (not precise!)
       offset = state_.stamp - point_time(raw->points.back(), sweep_time) - 1.e-4; 
@@ -240,6 +236,18 @@ PROFC_NODE("LiDAR Callback")
       PROFC_PRINT()
   }
 
+  void lidar_callback(const sensor_msgs::PointCloud2::ConstPtr& msg) {
+    PointCloudT::Ptr raw(boost::make_shared<PointCloudT>());
+    fromROS(*msg, *raw);
+    process_pointcloud(raw, msg->header.stamp.toSec());
+  }
+
+  void livox_callback(const livox_ros_driver::CustomMsg::ConstPtr& msg) {
+    PointCloudT::Ptr raw(boost::make_shared<PointCloudT>());
+    fromROS(*msg, *raw);
+    process_pointcloud(raw, msg->header.stamp.toSec());
+  }
+
 
   void stop_update_callback(const std_msgs::Bool::ConstPtr& msg) {
     if (not stop_ioctree_update_ and msg->data) {
@@ -266,11 +274,20 @@ int main(int argc, char** argv) {
   Manager manager = Manager(nh);
 
   // Subscribers
-  ros::Subscriber lidar_sub = nh.subscribe(cfg.topics.input.lidar,
-                                           1,
-                                           &Manager::lidar_callback,
-                                           &manager,
-                                           ros::TransportHints().tcpNoDelay());
+  ros::Subscriber lidar_sub;
+  if (cfg.sensors.lidar.type == 3) {
+    lidar_sub = nh.subscribe(cfg.topics.input.lidar,
+                             1,
+                             &Manager::livox_callback,
+                             &manager,
+                             ros::TransportHints().tcpNoDelay());
+  } else {
+    lidar_sub = nh.subscribe(cfg.topics.input.lidar,
+                             1,
+                             &Manager::lidar_callback,
+                             &manager,
+                             ros::TransportHints().tcpNoDelay());
+  }
 
   ros::Subscriber imu_sub = nh.subscribe(cfg.topics.input.imu,
                                          1000,
