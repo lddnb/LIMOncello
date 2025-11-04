@@ -6,14 +6,11 @@
 #include <iostream>
 #include <algorithm>
 
-#include <sensor_msgs/PointCloud2.h>
-
 #define PCL_NO_PRECOMPILE
 #include <pcl/io/pcd_io.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl/common/transforms.h>
-#include <pcl_conversions/pcl_conversions.h>
 #include <pcl/filters/filter.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/filters/passthrough.h>

@@ -1,311 +1,355 @@
-#include <mutex>
+#include <atomic>
 #include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <vector>
+#include <future>
 
 #include <Eigen/Dense>
-
-#include <ros/ros.h>
-
-#include <geometry_msgs/Vector3.h>
-#include <sensor_msgs/Imu.h>
-#include <sensor_msgs/PointCloud2.h>
-#include <std_msgs/Bool.h>
+#include <pcl/common/transforms.h>
+#include <pcl/console/print.h>
 #include <spdlog/spdlog.h>
 
+#include <flatbuffers/flatbuffers.h>
+#include <iox2/iceoryx2.hpp>
 
-#include "Core/Octree.hpp"
-#include "Core/State.hpp"
+#include <slam_common/callback_dispatcher.hpp>
+#include <slam_common/flatbuffers_pub_sub.hpp>
+#include <slam_common/foxglove_messages.hpp>
+
 #include "Core/Cloud.hpp"
 #include "Core/Imu.hpp"
-
+#include "Core/Octree.hpp"
+#include "Core/State.hpp"
 #include "Utils/Config.hpp"
-#include "ROSutils.hpp"
+#include "Utils/IO.hpp"
 
+using namespace ms_slam::slam_common;
 
-class Manager {
-  State  state_;
-  States state_buffer_;
-  
-  Imu prev_imu_;
-  double first_imu_stamp_;
+namespace
+{
 
-  bool imu_calibrated_;
+class Manager
+{
+  public:
+    Manager(std::shared_ptr<FBSPublisher<FoxglovePoseInFrame>> state_pub,
+            std::shared_ptr<FBSPublisher<FoxglovePointCloud>> frame_pub,
+            std::shared_ptr<FBSPublisher<FoxglovePosesInFrame>> path_pub)
+        : state_buffer_(1000),
+          pub_state_(std::move(state_pub)),
+          pub_frame_(std::move(frame_pub)),
+          pub_path_(std::move(path_pub)),
+          path_history_(),
+          pose_builder_(1024),
+          cloud_builder_(1024 * 1024),
+          path_builder_(1024 * 32)
+    {
+        Config& cfg = Config::getInstance();
 
-  std::mutex mtx_state_;
-  std::mutex mtx_buffer_;
+        imu_calibrated_ = !(cfg.sensors.calibration.gravity || cfg.sensors.calibration.accel || cfg.sensors.calibration.gyro);
+        ioctree_.setBucketSize(cfg.ioctree.bucket_size);
+        ioctree_.setDownsample(cfg.ioctree.downsample);
+        ioctree_.setMinExtent(cfg.ioctree.min_extent);
+        stop_ioctree_update_ = false;
 
-  std::condition_variable cv_prop_stamp_;
+        first_imu_stamp_ = -1.0;
+        prev_imu_timestamp_ = -1.0;
+    }
 
-  charlie::Octree ioctree_;
-  bool stop_ioctree_update_;
+    void HandleImu(const Imu& imu_msg)
+    {
+        Config& cfg = Config::getInstance();
 
-  ros::Publisher pub_state_, 
-                 pub_frame_, 
-                 pub_raw_, 
-                 pub_deskewed_, 
-                 pub_downsampled_, 
-                 pub_to_match_;
-
-  
-public:
-  Manager(ros::NodeHandle& nh) : first_imu_stamp_(-1.0), 
-                                       state_buffer_(1000), 
-                                       stop_ioctree_update_(false),
-                                       ioctree_() {
-
-    Config& cfg = Config::getInstance();
-
-    imu_calibrated_ = not (cfg.sensors.calibration.gravity
-                           or cfg.sensors.calibration.accel
-                           or cfg.sensors.calibration.gyro); 
-
-    ioctree_.setBucketSize(cfg.ioctree.bucket_size);
-    ioctree_.setDownsample(cfg.ioctree.downsample);
-    ioctree_.setMinExtent(cfg.ioctree.min_extent);
-
-    // Publishers
-    pub_state_ = nh.advertise<nav_msgs::Odometry>(cfg.topics.output.state, 10);
-    pub_frame_ = nh.advertise<sensor_msgs::PointCloud2>(cfg.topics.output.frame, 10);
-
-    // Debug only
-    pub_raw_         = nh.advertise<sensor_msgs::PointCloud2>("debug/raw",         10);
-    pub_deskewed_    = nh.advertise<sensor_msgs::PointCloud2>("debug/deskewed",    10);
-    pub_downsampled_ = nh.advertise<sensor_msgs::PointCloud2>("debug/downsampled", 10);
-    pub_to_match_    = nh.advertise<sensor_msgs::PointCloud2>("debug/to_match",    10);
-  };
-  
-  ~Manager() = default;
-
-
-  void imu_callback(const sensor_msgs::Imu::ConstPtr& msg) {
-
-    Config& cfg = Config::getInstance();
-
-    Imu imu = fromROS(msg);
-
-    if (first_imu_stamp_ < 0.)
-      first_imu_stamp_ = imu.stamp;
-    
-    if (not imu_calibrated_) {
-      static int N(0);
-      static Eigen::Vector3d gyro_avg(0., 0., 0.);
-      static Eigen::Vector3d accel_avg(0., 0., 0.);
-      static Eigen::Vector3d grav_vec(0., 0., cfg.sensors.extrinsics.gravity);
-
-      if ((imu.stamp - first_imu_stamp_) < cfg.sensors.calibration.time) {
-        gyro_avg  += imu.ang_vel;
-        accel_avg += imu.lin_accel; 
-        N++;
-
-      } else {
-        gyro_avg /= N;
-        accel_avg /= N;
-
-        if (cfg.sensors.calibration.gravity) {
-          grav_vec = accel_avg.normalized() * abs(cfg.sensors.extrinsics.gravity);
-          state_.g(-grav_vec);
+        if (first_imu_stamp_ < 0.0) {
+            first_imu_stamp_ = imu_msg.timestamp();
         }
-        
-        if (cfg.sensors.calibration.gyro)
-          state_.b_w(gyro_avg);
 
-        if (cfg.sensors.calibration.accel)
-          state_.b_a(accel_avg - grav_vec);
+        if (!imu_calibrated_) {
+            static int N = 0;
+            static Eigen::Vector3d gyro_avg = Eigen::Vector3d::Zero();
+            static Eigen::Vector3d accel_avg = Eigen::Vector3d::Zero();
+            static Eigen::Vector3d grav_vec(0.0, 0.0, cfg.sensors.extrinsics.gravity);
 
-        imu_calibrated_ = true;
-      }
+            if ((imu_msg.timestamp() - first_imu_stamp_) < cfg.sensors.calibration.time) {
+                gyro_avg += imu_msg.angular_velocity();
+                accel_avg += imu_msg.linear_acceleration();
+                ++N;
+                return;
+            }
 
-    } else {
-      double dt = imu.stamp - prev_imu_.stamp;
+            if (N > 0) {
+                gyro_avg /= static_cast<double>(N);
+                accel_avg /= static_cast<double>(N);
+            }
 
-      if (dt < 0)
-        ROS_ERROR("IMU timestamps not correct");
+            if (cfg.sensors.calibration.gravity) {
+                grav_vec = accel_avg.normalized() * std::abs(cfg.sensors.extrinsics.gravity);
+                state_.g(-grav_vec);
+            }
 
-      dt = (dt < 0 or dt >= imu.stamp) ? 1./cfg.sensors.imu.hz : dt;
+            if (cfg.sensors.calibration.gyro) {
+                state_.b_w(gyro_avg);
+            }
 
-      imu = imu2baselink(imu, dt);
+            if (cfg.sensors.calibration.accel) {
+                state_.b_a(accel_avg - grav_vec);
+            }
 
-      // Correct acceleration
-      imu.lin_accel = cfg.sensors.intrinsics.sm * imu.lin_accel;
-      prev_imu_ = imu;
+            imu_calibrated_ = true;
+            prev_imu_ = imu_msg;
+            prev_imu_timestamp_ = imu_msg.timestamp();
+            return;
+        }
 
-      mtx_state_.lock();
-        state_.predict(imu, dt);
-      mtx_state_.unlock();
+        double dt = (prev_imu_timestamp_ > 0.0) ? imu_msg.timestamp() - prev_imu_timestamp_ : 0.0;
+        if (dt <= 0.0 || dt >= imu_msg.timestamp()) {
+            dt = 1.0 / static_cast<double>(cfg.sensors.imu.hz);
+        }
 
-      mtx_buffer_.lock();
-        state_buffer_.push_front(state_);
-      mtx_buffer_.unlock();
+        Imu transformed = limoncello::imu2baselink(imu_msg, dt);
+        const Eigen::Vector3d corrected_acc = cfg.sensors.intrinsics.sm * transformed.linear_acceleration();
+        const Imu corrected(transformed.angular_velocity(), corrected_acc, transformed.timestamp());
 
-      cv_prop_stamp_.notify_one();
+        prev_imu_ = corrected;
+        prev_imu_timestamp_ = corrected.timestamp();
 
-      pub_state_.publish(toROS(state_));
+        {
+            std::lock_guard<std::mutex> lock(mtx_state_);
+            state_.predict(corrected, dt);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mtx_buffer_);
+            state_buffer_.push_front(state_);
+        }
+
+        cv_prop_stamp_.notify_one();
+
+        PublishPose();
     }
 
-  }
-  void process_pointcloud(const PointCloudT::Ptr& raw, double header_stamp) {
-PROFC_NODE("LiDAR Callback")
+    void HandlePointCloud(const PointCloudT::Ptr& raw, double header_stamp)
+    {
+        Config& cfg = Config::getInstance();
 
-    Config& cfg = Config::getInstance();
+        if (!raw || raw->points.empty()) {
+            spdlog::error("[LIMOncello] Raw point cloud is empty");
+            return;
+        }
 
-    if (raw->points.empty()) {
-      ROS_ERROR("[LIMONCELLO] Raw PointCloud is empty!");
-      return;
+        if (!imu_calibrated_) {
+            return;
+        }
+
+        if (state_buffer_.empty()) {
+            spdlog::error("[LIMOncello] No IMUs received");
+            return;
+        }
+
+        PointTime point_time = point_time_func();
+        double sweep_time = header_stamp + cfg.sensors.TAI_offset;
+
+        double offset = 0.0;
+        if (cfg.sensors.time_offset) {
+            offset = state_.stamp - point_time(raw->points.back(), sweep_time) - 1.e-4;
+            if (offset > 0.0) {
+                offset = 0.0;
+            }
+        }
+
+        double start_stamp = point_time(raw->points.front(), sweep_time) + offset;
+        double end_stamp = point_time(raw->points.back(), sweep_time) + offset;
+
+        if (state_buffer_.front().stamp < end_stamp) {
+            std::unique_lock<std::mutex> lock(mtx_buffer_);
+            cv_prop_stamp_.wait(lock, [this, end_stamp] { return state_buffer_.front().stamp >= end_stamp; });
+        }
+
+        States interpolated(250);
+        {
+            std::lock_guard<std::mutex> lock(mtx_buffer_);
+            interpolated = filter_states(state_buffer_, start_stamp, end_stamp);
+        }
+
+        if (interpolated.empty() || start_stamp < interpolated.front().stamp) {
+            spdlog::warn("Not enough interpolated states for deskewing point cloud");
+            return;
+        }
+
+        PointCloudT::Ptr deskewed = deskew(raw, state_, interpolated, offset, sweep_time);
+        PointCloudT::Ptr downsampled = voxel_grid(deskewed);
+        PointCloudT::Ptr processed = process(downsampled);
+
+        if (processed->points.empty()) {
+            spdlog::error("[LIMOncello] Processed & downsampled cloud is empty");
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mtx_state_);
+            state_.update(processed, ioctree_);
+        }
+
+        const Eigen::Affine3f T = (state_.affine3d() * state_.I2L_affine3d()).cast<float>();
+        PointCloudT::Ptr global(boost::make_shared<PointCloudT>());
+        pcl::transformPointCloud(*deskewed, *global, T);
+        pcl::transformPointCloud(*processed, *processed, T);
+
+        if (!stop_ioctree_update_) {
+            ioctree_.update(processed->points);
+        }
+
+        PublishPose();
+        PublishPointCloud(*global);
+        UpdateAndPublishPath();
+
+        if (cfg.verbose) {
+            PROFC_PRINT()
+        }
     }
 
-    if (not imu_calibrated_)
-      return;
-
-    if (state_buffer_.empty()) {
-      ROS_ERROR("[LIMONCELLO] No IMUs received");
-      return;
+    void StopUpdates(bool stop)
+    {
+        stop_ioctree_update_ = stop;
+        spdlog::info("LIMOncello - ioctree updates {}", stop ? "disabled" : "enabled");
     }
 
-    PointTime point_time = point_time_func();
-    double sweep_time = header_stamp + cfg.sensors.TAI_offset;
+  private:
+    void PublishPose()
+    {
+        if (!pub_state_) {
+            return;
+        }
+        limoncello::PoseSample pose;
+        {
+            std::lock_guard<std::mutex> lock(mtx_state_);
+            pose.timestamp = state_.stamp;
+            pose.position = state_.p();
+            pose.orientation = state_.quat();
+        }
 
-    double offset = 0.0;
-    if (cfg.sensors.time_offset) { // automatic sync (not precise!)
-      offset = state_.stamp - point_time(raw->points.back(), sweep_time) - 1.e-4; 
-      if (offset > 0.0) offset = 0.0; // don't jump into future
+        if (limoncello::BuildPoseMessage(pose, Config::getInstance().topics.frame_id, pose_builder_)) {
+            pub_state_->publish_from_builder(pose_builder_);
+        }
+
+        latest_pose_ = pose;
     }
 
-    // Wait for state buffer
-    double start_stamp = point_time(raw->points.front(), sweep_time) + offset;
-    double end_stamp   = point_time(raw->points.back(), sweep_time) + offset;
-
-    if (state_buffer_.front().stamp < end_stamp) {
-      std::cout << std::setprecision(20);
-      std::cout <<
-        "PROPAGATE WAITING... \n" <<
-        "     - buffer time: " << state_buffer_.front().stamp << "\n"
-        "     - end scan time: " << end_stamp << std::endl;
-
-      std::unique_lock<decltype(mtx_buffer_)> lock(mtx_buffer_);
-      cv_prop_stamp_.wait(lock, [this, &end_stamp] { 
-          return state_buffer_.front().stamp >= end_stamp;
-      });
-    } 
-
-
-  mtx_buffer_.lock();
-    States interpolated = filter_states(state_buffer_, start_stamp, end_stamp);
-  mtx_buffer_.unlock();
-
-    if (start_stamp < interpolated.front().stamp or interpolated.size() == 0) {
-      // every points needs to have a state associated not in the past
-      ROS_WARN("Not enough interpolated states for deskewing pointcloud \n");
-      return;
+    void PublishPointCloud(const PointCloudT& cloud)
+    {
+        if (!pub_frame_) {
+            return;
+        }
+        if (limoncello::BuildPointCloudMessage(cloud, Config::getInstance().topics.frame_id, latest_pose_.timestamp, cloud_builder_)) {
+            pub_frame_->publish_from_builder(cloud_builder_);
+        }
     }
 
-  mtx_state_.lock();
+    void UpdateAndPublishPath()
+    {
+        if (!pub_path_) {
+            return;
+        }
 
-    PointCloudT::Ptr deskewed    = deskew(raw, state_, interpolated, offset, sweep_time);
-    PointCloudT::Ptr downsampled = voxel_grid(deskewed);
-    PointCloudT::Ptr processed   = process(downsampled);
+        path_history_.push_back(latest_pose_);
+        constexpr std::size_t kMaxPathSize = 2048;
+        if (path_history_.size() > kMaxPathSize) {
+            path_history_.erase(path_history_.begin(), path_history_.begin() + (path_history_.size() - kMaxPathSize));
+        }
 
-    if (processed->points.empty()) {
-      ROS_ERROR("[LIMONCELLO] Processed & downsampled cloud is empty!");
-      return;
+        if (limoncello::BuildPathMessage(path_history_, latest_pose_.timestamp, Config::getInstance().topics.frame_id, path_builder_)) {
+            pub_path_->publish_from_builder(path_builder_);
+        }
     }
 
-    state_.update(processed, ioctree_);
-    Eigen::Affine3f T = (state_.affine3d() * state_.I2L_affine3d()).cast<float>();
+    State state_;
+    States state_buffer_;
 
-  mtx_state_.unlock();
+    Imu prev_imu_;
+    double prev_imu_timestamp_{-1.0};
+    double first_imu_stamp_{-1.0};
+    bool imu_calibrated_{false};
 
-    PointCloudT::Ptr global(boost::make_shared<PointCloudT>());
-    pcl::transformPointCloud(*deskewed, *global, T);
-    pcl::transformPointCloud(*processed, *processed, T);
+    std::mutex mtx_state_;
+    std::mutex mtx_buffer_;
+    std::condition_variable cv_prop_stamp_;
 
-    // Publish
-    pub_state_.publish(toROS(state_));
-    pub_frame_.publish(toROS(global));
+    charlie::Octree ioctree_;
+    std::atomic<bool> stop_ioctree_update_{false};
 
-    if (cfg.debug) {
-      pub_raw_.publish(toROS(raw));
-      pub_deskewed_.publish(toROS(deskewed));
-      pub_downsampled_.publish(toROS(downsampled));
-      pub_to_match_.publish(toROS(processed));
-    }
+    std::shared_ptr<FBSPublisher<FoxglovePoseInFrame>> pub_state_;
+    std::shared_ptr<FBSPublisher<FoxglovePointCloud>> pub_frame_;
+    std::shared_ptr<FBSPublisher<FoxglovePosesInFrame>> pub_path_;
 
-    // Update map
-    if (not stop_ioctree_update_)
-      ioctree_.update(processed->points);
-
-    if (cfg.verbose)
-      PROFC_PRINT()
-  }
-
-  void lidar_callback(const sensor_msgs::PointCloud2::ConstPtr& msg) {
-    PointCloudT::Ptr raw(boost::make_shared<PointCloudT>());
-    fromROS(*msg, *raw);
-    process_pointcloud(raw, msg->header.stamp.toSec());
-  }
-
-  void livox_callback(const livox_ros_driver::CustomMsg::ConstPtr& msg) {
-    PointCloudT::Ptr raw(boost::make_shared<PointCloudT>());
-    fromROS(*msg, *raw);
-    process_pointcloud(raw, msg->header.stamp.toSec());
-  }
-
-
-  void stop_update_callback(const std_msgs::Bool::ConstPtr& msg) {
-    if (not stop_ioctree_update_ and msg->data) {
-      stop_ioctree_update_ = msg->data;
-      ROS_INFO("Stopping ioctree updates from now onwards");
-    }
-  }
-
+    limoncello::PoseSample latest_pose_{};
+    std::vector<limoncello::PoseSample> path_history_;
+    flatbuffers::FlatBufferBuilder pose_builder_;
+    flatbuffers::FlatBufferBuilder cloud_builder_;
+    flatbuffers::FlatBufferBuilder path_builder_;
 };
 
+}  // namespace
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv)
+{
+    pcl::console::setVerbosityLevel(pcl::console::L_ALWAYS);
 
-  pcl::console::setVerbosityLevel(pcl::console::L_ALWAYS);
-  
-  ros::init(argc, argv, "limoncello");
-  ros::NodeHandle nh("~");
-  
-  // Setup config parameters.
-  Config& cfg = Config::getInstance();
-  fill_config(cfg, nh); 
+    const std::string config_path = (argc > 1) ? std::string(argv[1]) : std::string("thirdparty/LIMOncello/config/ouster.yaml");
+    if (!LoadConfigFromFile(Config::getInstance(), config_path))
+    {
+        spdlog::error("Failed to load configuration file: {}", config_path);
+        return 1;
+    }
 
-  // Initialize manager (reads from config)
-  Manager manager = Manager(nh);
+    const Config& cfg = Config::getInstance();
 
-  // Subscribers
-  ros::Subscriber lidar_sub;
-  if (cfg.sensors.lidar.type == 3) {
-    lidar_sub = nh.subscribe(cfg.topics.input.lidar,
-                             1,
-                             &Manager::livox_callback,
-                             &manager,
-                             ros::TransportHints().tcpNoDelay());
-  } else {
-    lidar_sub = nh.subscribe(cfg.topics.input.lidar,
-                             1,
-                             &Manager::lidar_callback,
-                             &manager,
-                             ros::TransportHints().tcpNoDelay());
-  }
+    auto node = std::make_shared<iox2::Node<iox2::ServiceType::Ipc>>(
+        iox2::NodeBuilder().create<iox2::ServiceType::Ipc>().expect("Failed to create iceoryx node"));
 
-  ros::Subscriber imu_sub = nh.subscribe(cfg.topics.input.imu,
-                                         1000,
-                                         &Manager::imu_callback,
-                                         &manager,
-                                         ros::TransportHints().tcpNoDelay());
+    auto pub_state = std::make_shared<FBSPublisher<FoxglovePoseInFrame>>(node, cfg.topics.output.state);
+    auto pub_frame = std::make_shared<FBSPublisher<FoxglovePointCloud>>(node, cfg.topics.output.frame);
+    auto pub_path = std::make_shared<FBSPublisher<FoxglovePosesInFrame>>(node, cfg.topics.output.frame + std::string("_path"));
 
-  ros::Subscriber stop_sub = nh.subscribe(cfg.topics.input.stop_ioctree_udate,
-                                          10,
-                                          &Manager::stop_update_callback,
-                                          &manager);
+    Manager manager(pub_state, pub_frame, pub_path);
 
+    ms_slam::slam_common::CallbackDispatcher dispatcher;
+    dispatcher.set_poll_interval(std::chrono::milliseconds(1));
 
-  ros::AsyncSpinner spinner(0);
-  spinner.start();
-  
-  ros::waitForShutdown();
+    auto lidar_callback = [&manager](const FoxglovePointCloud& wrapper) {
+        const auto* msg = wrapper.get();
+        if (!msg) {
+            return;
+        }
+        PointCloudT cloud;
+        if (!limoncello::ConvertPointCloudMessage(*msg, cloud)) {
+            return;
+        }
+        PointCloudT::Ptr raw(boost::make_shared<PointCloudT>(cloud));
+        manager.HandlePointCloud(raw, limoncello::TimeToSeconds(msg->timestamp()));
+    };
 
-  return 0;
+    auto imu_callback = [&manager](const FoxgloveImu& wrapper) {
+        const auto* msg = wrapper.get();
+        if (!msg) {
+            return;
+        }
+        Imu imu;
+        if (!limoncello::ConvertImuMessage(*msg, imu)) {
+            return;
+        }
+        manager.HandleImu(imu);
+    };
+
+    auto lidar_sub = std::make_shared<FBSSubscriber<FoxglovePointCloud>>(node, cfg.topics.input.lidar, lidar_callback);
+    auto imu_sub = std::make_shared<FBSSubscriber<FoxgloveImu>>(node, cfg.topics.input.imu, imu_callback, ms_slam::slam_common::PubSubConfig{.subscriber_max_buffer_size = 1000});
+
+    dispatcher.register_subscriber<FBSSubscriber<FoxglovePointCloud>>(lidar_sub, "LIMOncelloPointCloud", 5);
+    dispatcher.register_subscriber<FBSSubscriber<FoxgloveImu>>(imu_sub, "LIMOncelloIMU", 10);
+    dispatcher.start();
+
+    spdlog::info("LIMOncello started with configuration: {}", config_path);
+
+    std::promise<void>().get_future().wait();
+    dispatcher.stop();
+    return 0;
 }
-

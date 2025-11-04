@@ -83,7 +83,7 @@ struct State {
 PROFC_NODE("predict")
     
     ProcessMatrix Gx, Gf; // Adjoint_X(u)^{-1}, J_r(u)  Sola-18, [https://arxiv.org/abs/1812.01537]
-    BundleT X_tmp = X.plus(f(imu.lin_accel, imu.ang_vel, dt) * dt, Gx, Gf);
+    BundleT X_tmp = X.plus(f(imu.linear_acceleration(), imu.angular_velocity(), dt) * dt, Gx, Gf);
 
     // Update covariance
     ProcessMatrix Fx = Gx + Gf * df_dx(imu, dt) * dt; // He-2021, [https://arxiv.org/abs/2102.03804] Eq. (26)
@@ -94,10 +94,10 @@ PROFC_NODE("predict")
     X = X_tmp;
 
     // Save info
-    a = imu.lin_accel;
-    w = imu.ang_vel;
+    a = imu.linear_acceleration();
+    w = imu.angular_velocity();
 
-    stamp = imu.stamp;
+    stamp = imu.timestamp();
   }
 
 
