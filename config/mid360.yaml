@@ -6,7 +6,7 @@ topics:
   output:
     state: state  
     frame: full_pcl
-  frame_id: global
+  frame_id: odom
 
 
 verbose: false   # print debug/performance board

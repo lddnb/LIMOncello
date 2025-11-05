@@ -12,7 +12,7 @@
 #include <spdlog/spdlog.h>
 
 #include <slam_common/foxglove_messages.hpp>
-#include <slam_adapter/sensor_preprocess.hpp>
+#include "slam_adapter/sensor_preprocess.hpp"
 #include <slam_core/imu.hpp>
 
 #include "Utils/Config.hpp"
@@ -29,9 +29,21 @@ struct PointFieldOffsets
     int32_t intensity{-1};
     int32_t time{-1};
     int32_t ring{-1};
-    int32_t reflectivity{-1};
-    int32_t timestamp{-1};
+    int32_t tag{-1};
 };
+
+struct LivoxPointRaw
+{
+  float x;
+  float y;
+  float z;
+  uint8_t reflectivity;
+  uint8_t tag;
+  uint8_t line;
+  uint8_t padding;
+  uint32_t offset_time;
+} __attribute__((packed));
+static_assert(sizeof(LivoxPointRaw) == 20, "Unexpected Livox point size");
 
 inline PointFieldOffsets ExtractOffsets(const foxglove::PointCloud& msg)
 {
@@ -53,16 +65,14 @@ inline PointFieldOffsets ExtractOffsets(const foxglove::PointCloud& msg)
             offsets.y = static_cast<int32_t>(field->offset());
         } else if (name == "z") {
             offsets.z = static_cast<int32_t>(field->offset());
-        } else if (name == "intensity") {
+        } else if (name == "intensity" || name == "reflectivity") {
             offsets.intensity = static_cast<int32_t>(field->offset());
-        } else if (name == "time" || name == "t") {
+        } else if (name == "time" || name == "offset_time") {
             offsets.time = static_cast<int32_t>(field->offset());
-        } else if (name == "ring") {
+        } else if (name == "ring" || name == "line") {
             offsets.ring = static_cast<int32_t>(field->offset());
-        } else if (name == "reflectivity") {
-            offsets.reflectivity = static_cast<int32_t>(field->offset());
-        } else if (name == "timestamp") {
-            offsets.timestamp = static_cast<int32_t>(field->offset());
+        } else if (name == "tag") {
+            offsets.tag = static_cast<int32_t>(field->offset());
         }
     }
     return offsets;
@@ -77,13 +87,6 @@ inline bool ConvertPointCloudMessage(const foxglove::PointCloud& msg, PointCloud
         return false;
     }
 
-    const PointFieldOffsets offsets = ExtractOffsets(msg);
-    if (offsets.x < 0 || offsets.y < 0 || offsets.z < 0 || offsets.intensity < 0)
-    {
-        spdlog::error("LIMOncello - point cloud missing XYZ or intensity fields");
-        return false;
-    }
-
     const std::size_t point_count = data->size() / stride;
     cloud.clear();
     cloud.reserve(point_count);
@@ -92,43 +95,18 @@ inline bool ConvertPointCloudMessage(const foxglove::PointCloud& msg, PointCloud
     cloud.height = 1;
     cloud.is_dense = false;
 
-    const auto& cfg = Config::getInstance();
+    const std::uint8_t *raw_ptr = data->Data();
+    for (std::size_t i = 0; i < point_count; ++i) {
+      LivoxPointRaw point{};
+      std::memcpy(&point, raw_ptr + i * stride, sizeof(LivoxPointRaw));
+      PointT pt{};
+      pt.x = point.x;
+      pt.y = point.y;
+      pt.z = point.z;
+      pt.intensity = static_cast<float>(point.reflectivity);
+      pt.timestamp = static_cast<double>(point.offset_time);
 
-    for (std::size_t i = 0; i < point_count; ++i)
-    {
-        const std::uint8_t* base = data->Data() + i * stride;
-        PointT pt{};
-        std::memcpy(&pt.x, base + offsets.x, sizeof(float));
-        std::memcpy(&pt.y, base + offsets.y, sizeof(float));
-        std::memcpy(&pt.z, base + offsets.z, sizeof(float));
-        std::memcpy(&pt.intensity, base + offsets.intensity, sizeof(float));
-
-        if (cfg.sensors.lidar.type == 0)  // Ouster
-        {
-            if (offsets.time >= 0) {
-                std::memcpy(&pt.t, base + offsets.time, sizeof(std::uint32_t));
-            } else {
-                pt.t = 0U;
-            }
-        }
-        else if (cfg.sensors.lidar.type == 1)  // Velodyne
-        {
-            if (offsets.time >= 0) {
-                std::memcpy(&pt.time, base + offsets.time, sizeof(float));
-            } else {
-                pt.time = 0.f;
-            }
-        }
-        else if (cfg.sensors.lidar.type == 2 || cfg.sensors.lidar.type == 3)  // Hesai / Livox
-        {
-            if (offsets.timestamp >= 0) {
-                std::memcpy(&pt.timestamp, base + offsets.timestamp, sizeof(double));
-            } else {
-                pt.timestamp = 0.0;
-            }
-        }
-
-        cloud.push_back(pt);
+      cloud.push_back(pt);
     }
 
     cloud.width = static_cast<uint32_t>(cloud.size());

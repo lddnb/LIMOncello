@@ -1,12 +1,8 @@
 #pragma once
 
-#include <boost/make_shared.hpp>
-
 #include <functional>
 #include <iostream>
-#include <algorithm>
 
-#define PCL_NO_PRECOMPILE
 #include <pcl/io/pcd_io.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -45,7 +41,7 @@ typedef std::function<double(const PointT&, const double&)> PointTime;
 typedef std::function<bool(const PointT&, const PointT&)> PointTimeComp;
 
 
-PointTime point_time_func() {
+inline PointTime point_time_func() {
   Config& cfg = Config::getInstance();
 
   constexpr double kNanoToSec = 1e-9;
@@ -74,7 +70,7 @@ PointTime point_time_func() {
     return [] (const PointT& p, const double& sweep_time) { return p.timestamp; };
 
   } else if (cfg.sensors.lidar.type == 3) { // LIVOX
-    return [kNanoToSec] (const PointT& p, const double& sweep_time) { return p.timestamp * kNanoToSec; };
+    return [kNanoToSec] (const PointT& p, const double& sweep_time) { return sweep_time + p.timestamp * kNanoToSec; };
 
   } else {
     std::cout << "-------------------------------------------\n";

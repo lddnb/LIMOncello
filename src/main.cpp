@@ -191,7 +191,7 @@ class Manager
         }
 
         const Eigen::Affine3f T = (state_.affine3d() * state_.I2L_affine3d()).cast<float>();
-        PointCloudT::Ptr global(boost::make_shared<PointCloudT>());
+        PointCloudT::Ptr global(std::make_shared<PointCloudT>());
         pcl::transformPointCloud(*deskewed, *global, T);
         pcl::transformPointCloud(*processed, *processed, T);
 
@@ -294,7 +294,7 @@ int main(int argc, char** argv)
 {
     pcl::console::setVerbosityLevel(pcl::console::L_ALWAYS);
 
-    const std::string config_path = (argc > 1) ? std::string(argv[1]) : std::string("thirdparty/LIMOncello/config/ouster.yaml");
+    const std::string config_path = (argc > 1) ? std::string(argv[1]) : std::string("../config/mid360.yaml");
     if (!LoadConfigFromFile(Config::getInstance(), config_path))
     {
         spdlog::error("Failed to load configuration file: {}", config_path);
@@ -306,9 +306,9 @@ int main(int argc, char** argv)
     auto node = std::make_shared<iox2::Node<iox2::ServiceType::Ipc>>(
         iox2::NodeBuilder().create<iox2::ServiceType::Ipc>().expect("Failed to create iceoryx node"));
 
-    auto pub_state = std::make_shared<FBSPublisher<FoxglovePoseInFrame>>(node, cfg.topics.output.state);
-    auto pub_frame = std::make_shared<FBSPublisher<FoxglovePointCloud>>(node, cfg.topics.output.frame);
-    auto pub_path = std::make_shared<FBSPublisher<FoxglovePosesInFrame>>(node, cfg.topics.output.frame + std::string("_path"));
+    auto pub_state = std::make_shared<FBSPublisher<FoxglovePoseInFrame>>(node, "/odom");
+    auto pub_frame = std::make_shared<FBSPublisher<FoxglovePointCloud>>(node, "/cloud_registered");
+    auto pub_path = std::make_shared<FBSPublisher<FoxglovePosesInFrame>>(node, "/path");
 
     Manager manager(pub_state, pub_frame, pub_path);
 
@@ -324,7 +324,7 @@ int main(int argc, char** argv)
         if (!limoncello::ConvertPointCloudMessage(*msg, cloud)) {
             return;
         }
-        PointCloudT::Ptr raw(boost::make_shared<PointCloudT>(cloud));
+        PointCloudT::Ptr raw(std::make_shared<PointCloudT>(cloud));
         manager.HandlePointCloud(raw, limoncello::TimeToSeconds(msg->timestamp()));
     };
 
@@ -341,7 +341,7 @@ int main(int argc, char** argv)
     };
 
     auto lidar_sub = std::make_shared<FBSSubscriber<FoxglovePointCloud>>(node, cfg.topics.input.lidar, lidar_callback);
-    auto imu_sub = std::make_shared<FBSSubscriber<FoxgloveImu>>(node, cfg.topics.input.imu, imu_callback, ms_slam::slam_common::PubSubConfig{.subscriber_max_buffer_size = 1000});
+    auto imu_sub = std::make_shared<FBSSubscriber<FoxgloveImu>>(node, cfg.topics.input.imu, imu_callback, ms_slam::slam_common::PubSubConfig{.subscriber_max_buffer_size = 100});
 
     dispatcher.register_subscriber<FBSSubscriber<FoxglovePointCloud>>(lidar_sub, "LIMOncelloPointCloud", 5);
     dispatcher.register_subscriber<FBSSubscriber<FoxgloveImu>>(imu_sub, "LIMOncelloIMU", 10);

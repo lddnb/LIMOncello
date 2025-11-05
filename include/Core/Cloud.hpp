@@ -60,7 +60,7 @@ PROFC_NODE("deskew")
 
   PointTime point_time = point_time_func();
 
-  PointCloudT::Ptr out(boost::make_shared<PointCloudT>());
+  PointCloudT::Ptr out(std::make_shared<PointCloudT>());
   out->points.resize(cloud->points.size());
 
   std::vector<int> indices(cloud->points.size());
@@ -105,7 +105,7 @@ PROFC_NODE("filter")
 
   Config& cfg = Config::getInstance();
 
-  PointCloudT::Ptr out(boost::make_shared<PointCloudT>());
+  PointCloudT::Ptr out(std::make_shared<PointCloudT>());
 
   int index = 0;
   std::copy_if(
@@ -155,7 +155,7 @@ PROFC_NODE("downsample")
   static pcl::VoxelGrid<PointT> filter;
   filter.setLeafSize(cfg.filters.voxel_grid.leaf_size.cast<float>());
 
-  PointCloudT::Ptr out(boost::make_shared<PointCloudT>());
+  PointCloudT::Ptr out(std::make_shared<PointCloudT>());
   filter.setInputCloud(cloud);
   filter.filter(*out);
 
