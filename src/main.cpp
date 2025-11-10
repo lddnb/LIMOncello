@@ -13,7 +13,6 @@
 #include <flatbuffers/flatbuffers.h>
 #include <iox2/iceoryx2.hpp>
 
-#include <slam_common/callback_dispatcher.hpp>
 #include <slam_common/flatbuffers_pub_sub.hpp>
 #include <slam_common/foxglove_messages.hpp>
 
@@ -98,6 +97,17 @@ class Manager
             imu_calibrated_ = true;
             prev_imu_ = imu_msg;
             prev_imu_timestamp_ = imu_msg.timestamp();
+
+            spdlog::info(
+                "Initialize with {} IMU:g = [{:.3f}, {:.3f}, {:.3f}], b_g = [{:.3f}, {:.3f}, {:.3f}], b_a = [{:.3f}, {:.3f}, {:.3f}], timestamp = {:.3f}",
+                N,
+                state_.g().x(), state_.g().y(), state_.g().z(),
+                state_.b_w().x(), state_.b_w().y(), state_.b_w().z(),
+                state_.b_a().x(), state_.b_a().y(), state_.b_a().z(),
+                imu_msg.timestamp());
+            state_.t(imu_msg.timestamp());
+            state_buffer_.push_front(state_);
+
             return;
         }
 
@@ -117,6 +127,7 @@ class Manager
             std::lock_guard<std::mutex> lock(mtx_state_);
             state_.predict(corrected, dt);
         }
+        // spdlog::info("[state] predict ts {}, pos: {:.3f} {:.3f} {:.3f}, quat: {:.3f} {:.3f} {:.3f} {:.3f}", state_.stamp, state_.p().x(), state_.p().y(), state_.p().z(), state_.quat().x(), state_.quat().y(), state_.quat().z(), state_.quat().w());
 
         {
             std::lock_guard<std::mutex> lock(mtx_buffer_);
@@ -170,6 +181,9 @@ class Manager
             std::lock_guard<std::mutex> lock(mtx_buffer_);
             interpolated = filter_states(state_buffer_, start_stamp, end_stamp);
         }
+        spdlog::info("[Lidar] stamp: {:.3f}, size: {}", start_stamp, raw->points.size());
+        spdlog::info("[state] state_buffer_.front: {:.3f}", state_buffer_.front().stamp);
+        spdlog::info("[state] interpolated.front: {:.3f}", interpolated.front().stamp);
 
         if (interpolated.empty() || start_stamp < interpolated.front().stamp) {
             spdlog::warn("Not enough interpolated states for deskewing point cloud");
@@ -178,7 +192,11 @@ class Manager
 
         PointCloudT::Ptr deskewed = deskew(raw, state_, interpolated, offset, sweep_time);
         PointCloudT::Ptr downsampled = voxel_grid(deskewed);
+        spdlog::info("[Lidar] downsize {}", downsampled->points.size());
         PointCloudT::Ptr processed = process(downsampled);
+        spdlog::info("[Lidar] processed {}", processed->points.size());
+        static size_t count = 0;
+        // pcl::io::savePCDFileBinary("/home/ubuntu/data/test_bag/noros_processed_" + std::to_string(count++) + ".pcd", *processed);
 
         if (processed->points.empty()) {
             spdlog::error("[LIMOncello] Processed & downsampled cloud is empty");
@@ -312,9 +330,6 @@ int main(int argc, char** argv)
 
     Manager manager(pub_state, pub_frame, pub_path);
 
-    ms_slam::slam_common::CallbackDispatcher dispatcher;
-    dispatcher.set_poll_interval(std::chrono::milliseconds(1));
-
     auto lidar_callback = [&manager](const FoxglovePointCloud& wrapper) {
         const auto* msg = wrapper.get();
         if (!msg) {
@@ -340,16 +355,19 @@ int main(int argc, char** argv)
         manager.HandleImu(imu);
     };
 
-    auto lidar_sub = std::make_shared<FBSSubscriber<FoxglovePointCloud>>(node, cfg.topics.input.lidar, lidar_callback);
-    auto imu_sub = std::make_shared<FBSSubscriber<FoxgloveImu>>(node, cfg.topics.input.imu, imu_callback, ms_slam::slam_common::PubSubConfig{.subscriber_max_buffer_size = 100});
-
-    dispatcher.register_subscriber<FBSSubscriber<FoxglovePointCloud>>(lidar_sub, "LIMOncelloPointCloud", 5);
-    dispatcher.register_subscriber<FBSSubscriber<FoxgloveImu>>(imu_sub, "LIMOncelloIMU", 10);
-    dispatcher.start();
+    auto lidar_sub = std::make_shared<ThreadedFBSSubscriber<FoxglovePointCloud>>(node, cfg.topics.input.lidar, lidar_callback);
+    auto imu_sub = std::make_shared<ThreadedFBSSubscriber<FoxgloveImu>>(
+        node,
+        cfg.topics.input.imu,
+        imu_callback,
+        ms_slam::slam_common::PubSubConfig{.subscriber_max_buffer_size = 100});
+    lidar_sub->start();
+    imu_sub->start();
 
     spdlog::info("LIMOncello started with configuration: {}", config_path);
 
     std::promise<void>().get_future().wait();
-    dispatcher.stop();
+    lidar_sub->stop();
+    imu_sub->stop();
     return 0;
 }
